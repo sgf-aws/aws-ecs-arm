@@ -1,0 +1,459 @@
+Description: >
+  Build ECS cluster and deploy EC2 Container Instances to
+  VPC and subnets using an Auto Scaling Group
+
+Metadata:
+  'AWS::CloudFormation::Interface':
+    ParameterGroups:
+      - Label:
+          default: 'ECS Parameters'
+        Parameters:
+          - EnvironmentName
+          - ClusterSizeMin
+          - ClusterSizeMax
+          - ClusterSizeDesired
+          - ECSLogGroup
+      - Label:
+          default: 'VPC Parameters'
+        Parameters:
+          - VPC
+          - Subnets
+      - Label:
+          default: 'EC2 Parameters'
+        Parameters:
+          - ECSAMI
+          - InstanceType
+          - CpuCredits
+          - KeyName
+          - LaunchTemplateCounter
+      - Label:
+          default: 'EBS Parameters'
+        Parameters:
+          - EBSDeviceName
+          - EbsVolumeSize
+          - EbsVolumeType
+
+Parameters:
+  EnvironmentName:
+    Description: An environment name that will be prefixed to resource names
+    Type: String
+    Default: example-arm
+
+  InstanceType:
+    Description: Which instance type should we use to build the ECS cluster?
+    Type: String
+    Default: t4g.small
+    AllowedValues:
+      # Intel Instance Types (AMD64)
+#      - t2.small
+#      - t2.micro
+      # ARM Instance Types (ARM64)
+      - t4g.small
+      - t4g.micro
+
+  CpuCredits:
+    Description: >
+      The credit option for CPU usage of the instance. Valid values are
+      standard and unlimited. T2 instances launch as standard by default.
+      T3/T4 instances launch as unlimited by default.
+      WARNING: The unlimited value may incur extra costs.
+    Type: String
+    Default: standard
+    AllowedValues:
+      - standard
+      - unlimited
+
+  ClusterSizeMin:
+    Description: Minimum number of ECS hosts you want to deploy.
+    Type: Number
+    Default: 2
+
+  ClusterSizeMax:
+    Description: Maximum number of ECS hosts you want to deploy.
+    Type: Number
+    Default: 10
+
+  ClusterSizeDesired:
+    Description: How many ECS hosts do you want to initially deploy?
+    Type: Number
+    Default: 2
+
+  VPC:
+    Description: The VPC that the ECS cluster is deployed to
+    Type: AWS::EC2::VPC::Id
+    Default: vpc-a1b2c3d4
+
+  Subnets:
+    Description: Choose which subnets this ECS cluster should be deployed to
+    Type: List<AWS::EC2::Subnet::Id>
+    Default: subnet-a1b2c3d4,subnet-a2b3c4d5,subnet-a3b4c5d6
+
+  ECSAMI:
+    Description: ECS-Optimized AMI ID
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    # Latest Amazon Linux 2 AMI for Intel (AMD64)
+#    Default: /aws/service/ecs/optimized-ami/amazon-linux-2/recommended/image_id
+    # Latest Amazon Linux 2 AMI for ARM (ARM64)
+    Default: /aws/service/ecs/optimized-ami/amazon-linux-2/arm64/recommended/image_id
+    # Need to manually specify an AMI?
+    #Type: String
+    #Default: ami-06c7d096f22c4c7dd
+    # Go to AMI page in EC2 console and search "arm64 ECS HVM GP2" to view AMIs for current EC2 console region.
+    # ami-06c7d096f22c4c7dd  <- "Amazon Linux AMI 2.0.20201130 arm64 ECS HVM GP2"
+    # ami-0c82553f75a31ffff  <- "Amazon Linux AMI 2.0.20201209 arm64 ECS HVM GP2"
+
+  KeyName:
+    Description: The EC2 Key Pair to allow SSH access to the ECS EC2 instances
+    Type: AWS::EC2::KeyPair::KeyName
+    Default: AWS-user@example.com
+
+  LaunchTemplateCounter:
+    Type: Number
+    Description: >
+      Increment this value whenever you need to force an update to the
+      EC2 Launch Template. This will deploy a new Launch Template with
+      the latest ECS-optimized image for ARM64.
+    Default: 0
+
+  EBSDeviceName:
+    Type: String
+    Description: Optional - Specifies the device mapping for the Volume
+    Default: /dev/xvda
+
+  EbsVolumeSize:
+    Type: Number
+    Description: >
+      Optional - Specifies the Size in GBs, of the newly created Amazon
+      Elastic Block Store (Amazon EBS) volume. Minimum 30GB.
+    Default: 30
+
+  EbsVolumeType:
+    Type: String
+    Description: Optional - Specifies the Type of (Amazon EBS) volume
+    Default: gp3
+    AllowedValues:
+      - ''
+      - standard
+      - io1
+      - gp2
+      - gp3
+      - sc1
+      - st1
+    ConstraintDescription: Must be a valid EC2 volume type.
+
+  ECSLogGroup:
+    Description: An environment name that will be prefixed to resource names
+    Type: String
+    Default: '/ecs/cluster/example-arm'
+
+Resources:
+  ECSClusterSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref VPC
+      GroupDescription: Inbound and Outbound rules for ECS cluster
+      GroupName: !Sub ${EnvironmentName} ECS security group
+      SecurityGroupIngress:
+        # Allow SSH access from other hosts on same subnet TO our ECS EC2 host instances
+        - IpProtocol: tcp
+          FromPort: '22'
+          ToPort: '22'
+          CidrIp: 10.10.0.0/16
+          Description: "ssh (internal admin)"
+        # Allow HTTP access FROM other hosts on same subnet TO our ECS EC2 host instances (e.g. ALB to ECS)
+        - IpProtocol: tcp
+          FromPort: '32768'
+          ToPort: "60999"
+          CidrIp: 10.10.0.0/16
+          Description: "http (docker dynamic ports)"
+      SecurityGroupEgress:
+        # Allow ANY access FROM our ECS EC2 host instances and ECS services TO anywhere on Internet
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: "ANY"
+
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Ref EnvironmentName
+
+  LaunchTemplate:
+    Type: 'AWS::EC2::LaunchTemplate'
+    Metadata:
+      'AWS::CloudFormation::Init':
+        configSets:
+          default:
+            - awslogs
+            - install
+        awslogs:
+          packages:
+            yum:
+              awslogs: []
+          files:
+            '/etc/awslogs/awscli.conf':
+              content: !Sub |
+                [default]
+                region = ${AWS::Region}
+                [plugins]
+                cwlogs = cwlogs
+              mode: '000644'
+              owner: root
+              group: root
+            '/etc/awslogs/awslogs.conf':
+              content: !Sub |
+                [general]
+                state_file = /var/lib/awslogs/agent-state
+                [/var/log/amazon/ssm/amazon-ssm-agent.log]
+                datetime_format = %Y-%m-%d %H:%M:%S
+                file = /var/log/amazon/ssm/amazon-ssm-agent.log
+                log_stream_name = {instance_id}/var/log/amazon/ssm/amazon-ssm-agent.log
+                log_group_name = ${ECSLogGroup}
+                [/var/log/amazon/ssm/errors.log]
+                datetime_format = %Y-%m-%d %H:%M:%S
+                file = /var/log/amazon/ssm/errors.log
+                log_stream_name = {instance_id}/var/log/amazon/ssm/errors.log
+                log_group_name = ${ECSLogGroup}
+                [/var/log/audit/audit.log]
+                file = /var/log/audit/audit.log
+                log_stream_name = {instance_id}/var/log/audit/audit.log
+                log_group_name = ${ECSLogGroup}
+                [/var/log/awslogs.log]
+                datetime_format = %Y-%m-%d %H:%M:%S
+                file = /var/log/awslogs.log
+                log_stream_name = {instance_id}/var/log/awslogs.log
+                log_group_name = ${ECSLogGroup}
+                [/var/log/boot.log]
+                file = /var/log/boot.log
+                log_stream_name = {instance_id}/var/log/boot.log
+                log_group_name = ${ECSLogGroup}
+                [/var/log/cfn-hup.log]
+                datetime_format = %Y-%m-%d %H:%M:%S
+                file = /var/log/cfn-hup.log
+                log_stream_name = {instance_id}/var/log/cfn-hup.log
+                log_group_name = ${ECSLogGroup}
+                [/var/log/cfn-init-cmd.log]
+                datetime_format = %Y-%m-%d %H:%M:%S
+                file = /var/log/cfn-init-cmd.log
+                log_stream_name = {instance_id}/var/log/cfn-init-cmd.log
+                log_group_name = ${ECSLogGroup}
+                [/var/log/cfn-init.log]
+                datetime_format = %Y-%m-%d %H:%M:%S
+                file = /var/log/cfn-init.log
+                log_stream_name = {instance_id}/var/log/cfn-init.log
+                log_group_name = ${ECSLogGroup}
+                [/var/log/cfn-wire.log]
+                datetime_format = %Y-%m-%d %H:%M:%S
+                file = /var/log/cfn-wire.log
+                log_stream_name = {instance_id}/var/log/cfn-wire.log
+                log_group_name = ${ECSLogGroup}
+                [/var/log/cloud-init-output.log]
+                file = /var/log/cloud-init-output.log
+                log_stream_name = {instance_id}/var/log/cloud-init-output.log
+                log_group_name = ${ECSLogGroup}
+                [/var/log/cloud-init.log]
+                datetime_format = %b %d %H:%M:%S
+                file = /var/log/cloud-init.log
+                log_stream_name = {instance_id}/var/log/cloud-init.log
+                log_group_name = ${ECSLogGroup}
+                [/var/log/cron]
+                datetime_format = %b %d %H:%M:%S
+                file = /var/log/cron
+                log_stream_name = {instance_id}/var/log/cron
+                log_group_name = ${ECSLogGroup}
+                [/var/log/dmesg]
+                file = /var/log/dmesg
+                log_stream_name = {instance_id}/var/log/dmesg
+                log_group_name = ${ECSLogGroup}
+                [/var/log/grubby_prune_debug]
+                file = /var/log/grubby_prune_debug
+                log_stream_name = {instance_id}/var/log/grubby_prune_debug
+                log_group_name = ${ECSLogGroup}
+                [/var/log/maillog]
+                datetime_format = %b %d %H:%M:%S
+                file = /var/log/maillog
+                log_stream_name = {instance_id}/var/log/maillog
+                log_group_name = ${ECSLogGroup}
+                [/var/log/messages]
+                datetime_format = %b %d %H:%M:%S
+                file = /var/log/messages
+                log_stream_name = {instance_id}/var/log/messages
+                log_group_name = ${ECSLogGroup}
+                [/var/log/secure]
+                datetime_format = %b %d %H:%M:%S
+                file = /var/log/secure
+                log_stream_name = {instance_id}/var/log/secure
+                log_group_name = ${ECSLogGroup}
+                [/var/log/yum.log]
+                datetime_format = %b %d %H:%M:%S
+                file = /var/log/yum.log
+                log_stream_name = {instance_id}/var/log/yum.log
+                log_group_name = ${ECSLogGroup}
+              mode: '000644'
+              owner: root
+              group: root
+            '/etc/awslogs/config/ecs.conf':
+              content: !Sub |
+                [/var/log/ecs/ecs-init.log]
+                file = /var/log/ecs/ecs-init.log
+                log_stream_name = {instance_id}/var/log/ecs/ecs-init.log
+                log_group_name = ${ECSLogGroup}
+                datetime_format = %Y-%m-%dT%H:%M:%SZ
+                [/var/log/ecs/ecs-agent.log]
+                file = /var/log/ecs/ecs-agent.log.*
+                log_stream_name = {instance_id}/var/log/ecs/ecs-agent.log
+                log_group_name = ${ECSLogGroup}
+                datetime_format = %Y-%m-%dT%H:%M:%SZ
+              mode: '000644'
+              owner: root
+              group: root
+          services:
+            sysvinit:
+              awslogsd:
+                enabled: true
+                ensureRunning: true
+                packages:
+                  yum:
+                    - awslogs
+                files:
+                  - '/etc/awslogs/awslogs.conf'
+                  - '/etc/awslogs/awscli.conf'
+                  - '/etc/awslogs/config/ecs.conf'
+        install:
+          packages:
+            yum:
+              amazon-ssm-agent: []
+          files:
+            '/etc/cfn/cfn-hup.conf':
+              content: !Sub |
+                [main]
+                stack=${AWS::StackId}
+                region=${AWS::Region}
+                interval=1
+              mode: '000400'
+              owner: root
+              group: root
+            '/etc/cfn/hooks.d/cfn-auto-reloader.conf':
+              content: !Sub |
+                [cfn-auto-reloader-hook]
+                triggers=post.update
+                path=Resources.LaunchTemplate.Metadata.AWS::CloudFormation::Init
+                action=/opt/aws/bin/cfn-init --verbose --stack=${AWS::StackName} --region=${AWS::Region} --resource=LaunchTemplate
+                runas=root
+          services:
+            sysvinit:
+              cfn-hup:
+                enabled: true
+                ensureRunning: true
+                files:
+                  - '/etc/cfn/cfn-hup.conf'
+                  - '/etc/cfn/hooks.d/cfn-auto-reloader.conf'
+              amazon-ssm-agent:
+                enabled: true
+                ensureRunning: true
+                packages:
+                  yum:
+                    - amazon-ssm-agent
+    Properties:
+      LaunchTemplateData:
+        IamInstanceProfile:
+          Name: !Ref ECSInstanceProfile
+        ImageId: !Ref ECSAMI
+        InstanceType: !Ref InstanceType
+        CreditSpecification:
+          CpuCredits: !Ref CpuCredits
+        KeyName: !Ref KeyName
+        MetadataOptions:
+          HttpPutResponseHopLimit: 2 # support Docker containers
+          HttpTokens: required
+        SecurityGroupIds:
+          - !Ref ECSClusterSecurityGroup
+        BlockDeviceMappings:
+          - DeviceName: !Ref EBSDeviceName
+            Ebs:
+              VolumeSize: !Ref EbsVolumeSize
+              VolumeType: !Ref EbsVolumeType
+              DeleteOnTermination: true
+              Encrypted: true
+        UserData:
+          'Fn::Base64': !Sub |
+            #!/bin/bash -ex
+            echo "ECS AMI ${ECSAMI}"
+            echo "Launch Template Counter ${LaunchTemplateCounter}"
+            trap '/opt/aws/bin/cfn-signal -e 1 --stack ${AWS::StackName} --resource ECSAutoScalingGroup --region ${AWS::Region}' ERR
+            echo "ECS_CLUSTER=${ECSCluster}" >> /etc/ecs/ecs.config
+            yum install -y aws-cfn-bootstrap
+            /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource LaunchTemplate --region ${AWS::Region}
+            /opt/aws/bin/cfn-signal -e 0 --stack ${AWS::StackName} --resource ECSAutoScalingGroup --region ${AWS::Region}
+
+  ECSAutoScalingGroup:
+    DependsOn: ECSCluster
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier: !Ref Subnets
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt 'LaunchTemplate.LatestVersionNumber'
+      MinSize: !Ref ClusterSizeMin
+      MaxSize: !Ref ClusterSizeMax
+      DesiredCapacity: !Ref ClusterSizeDesired
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} ECS host
+          PropagateAtLaunch: true
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT15M
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 1
+        MaxBatchSize: 1
+        PauseTime: PT15M
+        # How can I correctly update my Auto Scaling group when I update my AWS CloudFormation stack?
+        # https://aws.amazon.com/premiumsupport/knowledge-center/auto-scaling-group-rolling-updates/
+        SuspendProcesses:
+          - HealthCheck
+          - ReplaceUnhealthy
+          - AZRebalance
+          - AlarmNotification
+          - ScheduledActions
+        WaitOnResourceSignals: true
+
+  # This IAM Role is attached to all of the ECS hosts. It is based on the default role
+  # published here:
+  # http://docs.aws.amazon.com/AmazonECS/latest/developerguide/instance_IAM_role.html
+  #
+  # You can add other IAM policy statements here to allow access from your ECS hosts
+  # to other AWS services. Please note that this role will be used by ALL containers
+  # running on the ECS host.
+
+  ECSRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      RoleName: !Sub ${EnvironmentName}-ECSRole-${AWS::Region}
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2RoleforSSM
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+
+  ECSInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref ECSRole
+
+Outputs:
+  Cluster:
+    Description: A reference to the ECS cluster
+    Value: !Ref ECSCluster
+
+  ECSAutoScalingGroupName:
+    Description: A reference to ECS AutoScaling Group Name
+    Value: !Ref ECSAutoScalingGroup

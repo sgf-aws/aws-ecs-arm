@@ -1,0 +1,136 @@
+Description: >
+  Build ECS Worker Task/Service. Deploy ECS Worker Service to selected ECS Cluster.
+
+Metadata:
+  'AWS::CloudFormation::Interface':
+    ParameterGroups:
+      - Label:
+          default: 'ECS Task Parameters'
+        Parameters:
+          - ContainerImage
+          - ServiceName
+          - ServiceCpu
+          - ServiceMemory
+          - ServiceWorkerType
+          - ServiceWorkerQueues
+      - Label:
+          default: 'ECS Service Parameters'
+        Parameters:
+          - VPC
+          - Cluster
+          - DesiredCount
+
+Parameters:
+  VPC:
+    Description: The VPC that the ECS cluster is deployed to
+    Type: AWS::EC2::VPC::Id
+    Default: vpc-a1b2c3d4
+
+  Cluster:
+    Description: Please provide the ECS Cluster ID that this service should run on
+    Type: String
+    Default: arn:aws:ecs:REGION:123412341234:cluster/example-arm
+
+  DesiredCount:
+    Description: How many instances of this task should we run across our cluster?
+    Type: Number
+    Default: 2
+
+  ContainerImage:
+    Description: The Task Container Image (full ECR path and tag)
+    Type: String
+    Default: 123412341234.dkr.ecr.REGION.amazonaws.com/arm64/example-app:latest
+
+  ServiceName:
+    Description: Name used for the ECS Service
+    Type: String
+    Default: app-worker-example
+
+  ServiceCpu:
+    Description: CPU Limit for this ECS Service (256 units = 1/4 vCPU)
+    Type: String
+    Default: 256
+
+  ServiceMemory:
+    Description: Memory Limit for this ECS Service (128 MB = 1/8 GB)
+    Type: String
+    Default: 128
+
+  ServiceWorkerType:
+    Description: Type of Worker Service. Valid values are "cron", "queue", and "queue-plain".
+    Type: String
+    Default: queue
+    AllowedValues:
+      - cron
+      - queue
+      - queue-plain
+    ConstraintDescription: Service Worker Type must be either "cron", "queue", or "queue-plain"
+
+  ServiceWorkerQueues:
+    Description: Comma Separated List of Queue Names processed by this Queue Worker Service. Leave blank for Cron Worker.
+    Type: String
+    Default: process-example-app-priority,process-example-app,process-example-export,process-example-report
+
+Conditions:
+  CreateQueueServiceWorker: !Equals [ !Ref ServiceWorkerType, queue ]
+  CreateQueuePlainServiceWorker: !Equals [ !Ref ServiceWorkerType, queue-plain ]
+
+Resources:
+  Service:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref Cluster
+      DesiredCount: !Ref DesiredCount
+      ServiceName: !Ref ServiceName
+      TaskDefinition: !Ref TaskDefinition
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 50
+        MaximumPercent: 200
+      PlacementStrategies:
+        - Type: spread
+          Field: attribute:ecs.availability-zone
+        - Type: spread
+          Field: instanceId
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      # Family: app-worker-example-arm64
+      Family: !Join [ "", [ !Ref ServiceName, "-arm64" ] ]
+      ExecutionRoleArn: arn:aws:iam::123412341234:role/ecsTaskExecutionRole
+      TaskRoleArn: arn:aws:iam::123412341234:role/ecsTaskRole
+      Cpu: !Ref ServiceCpu
+      Memory: !Ref ServiceMemory
+      RequiresCompatibilities:
+        - EC2
+      ContainerDefinitions:
+        - Name: worker
+          Essential: true
+          # Image: 123412341234.dkr.ecr.REGION.amazonaws.com/example-app:5b38dea
+          # Image: 123412341234.dkr.ecr.REGION.amazonaws.com/arm64/example-app:latest
+          Image: !Ref ContainerImage
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref CloudWatchLogsGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+          Command:
+            - "/usr/bin/supervisord"
+            - "-n"
+            - "-c"
+            - "/etc/supervisord.conf"
+          Environment:
+            - Name: SUPER_CMD
+              # Cron Worker Example
+              #Value: "/usr/bin/entrypoint.sh"
+              # Queue Worker Example
+              #Value: "php /var/www/artisan queue:work --queue=process-example-app-priority,process-example-app,process-example-query,process-example-export,process-example-report --sleep=5 --tries=3"
+              Value: !If [ CreateQueueServiceWorker, !Join [ "", [ "php /var/www/artisan queue:work --queue=", !Ref ServiceWorkerQueues, " --sleep=5 --tries=1" ] ], !If [ CreateQueuePlainServiceWorker, !Join [ "", [ "php /var/www/artisan queue:work --queue=", !Ref ServiceWorkerQueues, " --sleep=5 --tries=1 sqs-plain" ] ], "/usr/bin/entrypoint.sh" ] ]
+
+  CloudWatchLogsGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      # LogGroupName: /ecs/app-worker-example
+      LogGroupName: !Join [ "", [ "/ecs/", !Ref ServiceName ] ]
+      RetentionInDays: 365

@@ -1,0 +1,242 @@
+Description: >
+  Build ECS Web Task/Service. Deploy ECS Web Service to selected ECS Cluster.
+
+Metadata:
+  'AWS::CloudFormation::Interface':
+    ParameterGroups:
+      - Label:
+          default: 'ECS Task Parameters'
+        Parameters:
+          - ContainerImage
+          - Listener
+          - ServiceName
+          - ServiceCpu
+          - ServiceMemory
+      - Label:
+          default: 'ECS Service Parameters'
+        Parameters:
+          - VPC
+          - Cluster
+          - DesiredCount
+          - ListenerPrimaryHostHeader
+          - ListenerPrimaryRulePriority
+          - ListenerAliasHostHeader
+          - ListenerAliasRulePriority
+          - HealthCheckPath
+          - ContainerPort
+
+Parameters:
+  VPC:
+    Description: The VPC that the ECS cluster is deployed to
+    Type: AWS::EC2::VPC::Id
+    Default: vpc-a1b2c3d4
+
+  Cluster:
+    Description: The ECS Cluster ID that this service should run on
+    Type: String
+    Default: arn:aws:ecs:REGION:123412341234:cluster/example-arm
+
+  DesiredCount:
+    Description: How many instances of this task should we run across our cluster?
+    Type: Number
+    Default: 2
+
+  ContainerImage:
+    Description: The Task Container Image (full ECR path and tag)
+    Type: String
+    Default: 123412341234.dkr.ecr.REGION.amazonaws.com/arm64/example-app:latest
+
+  Listener:
+    Description: The Application Load Balancer listener to register with
+    Type: String
+    Default: arn:aws:elasticloadbalancing:REGION:123412341234:listener/app/example-app/abcd1234abcd1234/abcd1234abcd1234
+
+  ServiceName:
+    Description: Name used for the ECS Service
+    Type: String
+    Default: app-web
+
+  ServiceCpu:
+    Description: CPU Limit for this ECS Service
+    Type: String
+    Default: 256
+
+  ServiceMemory:
+    Description: Memory Limit for this ECS Service
+    Type: String
+    Default: 384
+
+  ListenerPrimaryHostHeader:
+    Description: Primary Hostname to register with the Application Load Balancer (e.g. "www.example.com").
+    Type: String
+    Default: app.example.com
+
+  ListenerAliasHostHeader:
+    Description: Alias Hostname to register with the Application Load Balancer (e.g. "cms.example.com"). If no alias, leave blank.
+    Type: String
+    Default: ""
+
+  ListenerPrimaryRulePriority:
+    Description: Priority for the Primary Listener Rule. Must be unique.
+    Type: Number
+    Default: 100
+
+  ListenerAliasRulePriority:
+    Description: Priority for the Alias Listener Rule. Must be unique. If no alias, set to 0.
+    Type: Number
+    Default: 0
+
+  HealthCheckPath:
+    Description: Specify an HTTP endpoint that returns a HTTP 2xx code (e.g. 200 OK) when host is healthy.
+    Type: String
+    Default: /_health
+
+  ContainerPort:
+    Description: What TCP port is the application listening on in your container? (default 80)
+    Type: Number
+    Default: 80
+
+Conditions:
+  CreateListenerRuleAlias: !Not [ !Equals [ !Ref ListenerAliasHostHeader, "" ] ]
+
+Resources:
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - ListenerRulePrimary
+    Properties:
+      Cluster: !Ref Cluster
+      DesiredCount: !Ref DesiredCount
+      LoadBalancers:
+        - ContainerName: "web"
+          ContainerPort: !Ref ContainerPort
+          TargetGroupArn: !Ref TargetGroup
+      Role: !Ref ServiceRole
+      ServiceName: !Ref ServiceName
+      TaskDefinition: !Ref TaskDefinition
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 50
+        MaximumPercent: 200
+      PlacementStrategies:
+        - Type: spread
+          Field: attribute:ecs.availability-zone
+        - Type: spread
+          Field: instanceId
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      # Family: app-web-arm64
+      Family: !Join [ "", [ !Ref ServiceName, "-arm64" ] ]
+      ExecutionRoleArn: arn:aws:iam::123412341234:role/ecsTaskExecutionRole
+      TaskRoleArn: arn:aws:iam::123412341234:role/ecsTaskRole
+      Cpu: !Ref ServiceCpu
+      Memory: !Ref ServiceMemory
+      RequiresCompatibilities:
+        - EC2
+      ContainerDefinitions:
+        - Name: web
+          Essential: true
+          # Image: 123412341234.dkr.ecr.REGION.amazonaws.com/example-app:5b38dea
+          # Image: 123412341234.dkr.ecr.REGION.amazonaws.com/arm64/example-app:latest
+          Image: !Ref ContainerImage
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref CloudWatchLogsGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+          PortMappings:
+            - ContainerPort: !Ref ContainerPort
+
+  CloudWatchLogsGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      # LogGroupName: /ecs/app-web
+      LogGroupName: !Join [ "", [ "/ecs/", !Ref ServiceName ] ]
+      RetentionInDays: 365
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      # Name: example-app-web-arm64
+      Name: !Join [ "", [ "example-", !Ref ServiceName, "-arm64" ] ]
+      Port: !Ref ContainerPort
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: !Ref HealthCheckPath
+      HealthyThresholdCount: 5
+      HealthCheckTimeoutSeconds: 5
+      HealthCheckIntervalSeconds: 30
+      Matcher:
+        HttpCode: 200-299
+
+  ListenerRulePrimary:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref Listener
+      Priority: !Ref ListenerPrimaryRulePriority
+      Conditions:
+        - Field: host-header
+          Values:
+            - !Ref ListenerPrimaryHostHeader
+      Actions:
+        - TargetGroupArn: !Ref TargetGroup
+          Type: forward
+
+  ListenerRuleAlias:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Condition: CreateListenerRuleAlias
+    Properties:
+      ListenerArn: !Ref Listener
+      Priority: !Ref ListenerAliasRulePriority
+      Conditions:
+        - Field: host-header
+          Values:
+            - !Ref ListenerAliasHostHeader
+      Actions:
+        - TargetGroupArn: !Ref TargetGroup
+          Type: forward
+
+  # This IAM Role grants the service access to register/unregister with the
+  # Application Load Balancer (ALB). It is based on the default documented here:
+  # http://docs.aws.amazon.com/AmazonECS/latest/developerguide/service_IAM_role.html
+  ServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ecs-service-role-stack-${AWS::StackName}
+      Path: /
+      AssumeRolePolicyDocument: |
+        {
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": { "Service": [ "ecs.amazonaws.com" ]},
+                "Action": [ "sts:AssumeRole" ]
+            }]
+        }
+      Policies:
+        - PolicyName: !Sub ecs-service-policy-stack-${AWS::StackName}
+          PolicyDocument:
+            {
+              "Version": "2012-10-17",
+              "Statement":
+                [
+                  {
+                    "Effect": "Allow",
+                    "Action":
+                      [
+                          "ec2:AuthorizeSecurityGroupIngress",
+                          "ec2:Describe*",
+                          "elasticloadbalancing:DeregisterInstancesFromLoadBalancer",
+                          "elasticloadbalancing:Describe*",
+                          "elasticloadbalancing:RegisterInstancesWithLoadBalancer",
+                          "elasticloadbalancing:DeregisterTargets",
+                          "elasticloadbalancing:DescribeTargetGroups",
+                          "elasticloadbalancing:DescribeTargetHealth",
+                          "elasticloadbalancing:RegisterTargets"
+                      ],
+                    "Resource": "*"
+                  }
+                ]
+            }
